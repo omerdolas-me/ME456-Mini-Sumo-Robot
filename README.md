@@ -6,6 +6,8 @@ This repository contains files and documentation for the **ME456 Mechatronics Pr
 
 ## Repository Structure
 
+The repository is divided into multiple **branches**, each containing specific files and progress related to the project:
+
 ### Competition
 Contains final robot design, Arduino/mBlock codes, and media files used during the **Mini Sumo Robot Competition**.  
 Includes strategy implementations (attack, defense, and avoidance) using **Finite State Machine (FSM)** logic.
