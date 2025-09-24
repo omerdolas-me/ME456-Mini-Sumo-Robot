@@ -1,0 +1,329 @@
+#include <Arduino.h>
+#include <math.h>
+
+// ——— PIN TANIMLARI ———
+// Çizgi sensörleri
+const uint8_t LINE_R = A0;
+const uint8_t LINE_L = A1;
+// Motor sürücü
+const uint8_t ENA = 10, IN1 = A2, IN2 = A3;
+const uint8_t ENB = 11, IN3 = A4, IN4 = A5;
+// Ultrasonikler
+const uint8_t TRIG_L = 4, ECHO_L = 5;
+const uint8_t TRIG_R = 2, ECHO_R = 3;
+
+// ——— Çizgi KAÇINMA PARAMETRELER ———
+const int     THRESHOLD         = 350;
+const int     KICK_SPEED        = 150;
+const unsigned long KICK_TIME   =  50;
+const int     BACKUP_SPEED      =  80;
+const unsigned long BACKUP_TIME = 400;
+const unsigned long TURN_TIME   = 450;
+
+// ——— HEDEF TAKİP PARAMETRELER ———
+const float   L_cm               = 7.5;    
+const int     ATTACK_SPEED       = -60;    
+const int     FAST_ATTACK_SPEED  = -200;   
+const int     ROTATE_SPEED       =   100;   
+const int     PIVOT_SPEED        =  100;   
+const float   MAX_LOST_DIST      = 200.0;  
+const float   DETECT_DIST        =  50.0;  
+const float   Kp                 =   0.5;  
+
+// ——— Durum Makinesi ———
+enum State { SEEKING, ATTACKING, SEARCHING, BACKING, TURNING };
+State state = SEEKING;
+
+unsigned long actionStart = 0;
+unsigned long now         = 0;
+
+void setup() {
+  Serial.begin(9600);
+  pinMode(ENA, OUTPUT);  pinMode(IN1, OUTPUT);  pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT);  pinMode(IN3, OUTPUT);  pinMode(IN4, OUTPUT);
+  pinMode(LINE_R, INPUT); pinMode(LINE_L, INPUT);
+  pinMode(TRIG_L, OUTPUT); pinMode(ECHO_L, INPUT);
+  pinMode(TRIG_R, OUTPUT); pinMode(ECHO_R, INPUT);
+}
+
+// ——— MAIN LOOP ———
+void loop() {
+  now = millis();
+
+  // 1) Çizgi sensörü OVERRIDE
+  int rawR = analogRead(LINE_R);
+  int rawL = analogRead(LINE_L);
+  if (rawR < THRESHOLD || rawL < THRESHOLD) {
+    setMotors(KICK_SPEED, KICK_SPEED); delay(KICK_TIME);
+    setMotors(BACKUP_SPEED, BACKUP_SPEED); delay(BACKUP_TIME);
+    setMotors(-PIVOT_SPEED, PIVOT_SPEED); delay(TURN_TIME);
+    setMotors(0,0); delay(50);
+    state = SEEKING;
+    return;
+  }
+
+  // 2) Durum makinesi
+  switch(state) {
+    case SEEKING: {
+      float d1 = readDistCM(TRIG_L,ECHO_L);
+      float d2 = readDistCM(TRIG_R,ECHO_R);
+      float dAvg = (d1+d2)*0.5;
+
+      // Herhangi bir sensör tetikledi mi?
+      if ((d1>0 && d1<DETECT_DIST) || (d2>0 && d2<DETECT_DIST)) {
+        state = ATTACKING;
+        Serial.println("→ ATTACKING!");
+        break;
+      }
+      // Kayıp mı?
+      if (dAvg>MAX_LOST_DIST || dAvg<=0) {
+        state = SEARCHING;
+        Serial.println("→ SEARCHING");
+        break;
+      }
+      // P-kontrol ile pivot
+      float error = d2 - d1;
+      float steer = constrain(Kp*error,-ROTATE_SPEED,ROTATE_SPEED);
+      int base = ATTACK_SPEED;
+      int l = constrain(base - (int)steer,-255,255);
+      int r = constrain(base + (int)steer,-255,255);
+      setMotors(r,l);
+      break;
+    }
+
+    case ATTACKING: {
+      float d1 = readDistCM(TRIG_L,ECHO_L);
+      float d2 = readDistCM(TRIG_R,ECHO_R);
+      float dAvg = (d1+d2)*0.5;
+      // Hala menzilde mi?
+      if (dAvg>MAX_LOST_DIST || dAvg<=0) {
+        state = SEARCHING;
+        Serial.println("→ TARGET LOST → SEARCHING");
+        break;
+      }
+      // P-kontrol steer
+      float error = d2 - d1;
+      float steer = constrain(Kp*error,-ROTATE_SPEED,ROTATE_SPEED);
+      int base;
+      // Mesafeye göre hız yavaşlama (gerekiyorsa entegre edilebilir)
+      if (dAvg<DETECT_DIST) base = FAST_ATTACK_SPEED;
+      else base = ATTACK_SPEED;
+      int l = constrain(base - (int)steer,-255,255);
+      int r = constrain(base + (int)steer,-255,255);
+      setMotors(r,l);
+      break;
+    }
+
+    case SEARCHING: {
+      setMotors(-ROTATE_SPEED,ROTATE_SPEED);
+      float d1 = readDistCM(TRIG_L,ECHO_L);
+      float d2 = readDistCM(TRIG_R,ECHO_R);
+      if ((d1>0 && d1<MAX_LOST_DIST) || (d2>0 && d2<MAX_LOST_DIST)) {
+        state = SEEKING;
+        Serial.println("→ FOUND → SEEKING");
+      }
+      break;
+    }
+
+    // BACKING & TURNING nadiren girer, önceki koddan aynen alabilirsiniz
+    case BACKING: {
+      unsigned long dt = now - actionStart;
+      int sp = dt<200 ? 100 : dt<400 ? 75 : 50;
+      setMotors(sp,sp);
+      if (dt>=BACKUP_TIME) { state=TURNING; actionStart=now; }
+      break;
+    }
+    case TURNING: {
+      setMotors(-PIVOT_SPEED,PIVOT_SPEED);
+      if (now-actionStart>=TURN_TIME) {
+        state=SEEKING;
+        Serial.println("→ DONE TURN → SEEKING");
+      }
+      break;
+    }
+  }
+
+  delay(10);
+}
+
+// ——— MOTOR KONTROL ———
+void setMotors(int r,int l){
+  if(r>=0){ digitalWrite(IN1,HIGH);digitalWrite(IN2,LOW); analogWrite(ENA,r); }
+  else    { digitalWrite(IN1,LOW); digitalWrite(IN2,HIGH);analogWrite(ENA,-r);}
+  if(l>=0){ digitalWrite(IN3,HIGH);digitalWrite(IN4,LOW); analogWrite(ENB,l); }
+  else    { digitalWrite(IN3,LOW); digitalWrite(IN4,HIGH);analogWrite(ENB,-l);}
+}
+
+// ——— ULTRASONIC OKUMA ———
+float readDistCM(uint8_t t,uint8_t e){
+  digitalWrite(t,LOW); delayMicroseconds(2);
+  digitalWrite(t,HIGH);delayMicroseconds(10);
+  digitalWrite(t,LOW);
+  unsigned long d = pulseIn(e,HIGH,30000);
+  return d/58.0;
+}
+
+
+
+#include <Arduino.h>
+#include <math.h>
+
+// ——— PIN TANIMLARI ———
+// Çizgi sensörleri
+const uint8_t LINE_R = A0;
+const uint8_t LINE_L = A1;
+// Motor sürücü
+const uint8_t ENA = 10, IN1 = A2, IN2 = A3;
+const uint8_t ENB = 11, IN3 = A4, IN4 = A5;
+// Ultrasonikler
+const uint8_t TRIG_L = 4, ECHO_L = 5;
+const uint8_t TRIG_R = 2, ECHO_R = 3;
+
+// ——— Çizgi KAÇINMA PARAMETRELER ———
+const int     THRESHOLD         = 350;
+const int     KICK_SPEED        = 150;
+const unsigned long KICK_TIME   =  50;
+const int     BACKUP_SPEED      =  80;
+const unsigned long BACKUP_TIME = 400;
+const unsigned long TURN_TIME   = 450;
+
+// ——— HEDEF TAKİP PARAMETRELER ———
+const float   L_cm               = 7.5;    
+const int     ATTACK_SPEED       = -60;    
+const int     FAST_ATTACK_SPEED  = -200;   
+const int     ROTATE_SPEED       =   100;   
+const int     PIVOT_SPEED        =  100;   
+const float   MAX_LOST_DIST      = 200.0;  
+const float   DETECT_DIST        =  50.0;  
+const float   Kp                 =   0.5;  
+
+// ——— Durum Makinesi ———
+enum State { SEEKING, ATTACKING, SEARCHING, BACKING, TURNING };
+State state = SEEKING;
+
+unsigned long actionStart = 0;
+unsigned long now         = 0;
+
+void setup() {
+  Serial.begin(9600);
+  // pinMode’lar
+  pinMode(ENA, OUTPUT);  pinMode(IN1, OUTPUT);  pinMode(IN2, OUTPUT);
+  pinMode(ENB, OUTPUT);  pinMode(IN3, OUTPUT);  pinMode(IN4, OUTPUT);
+  pinMode(LINE_R, INPUT); pinMode(LINE_L, INPUT);
+  pinMode(TRIG_L, OUTPUT); pinMode(ECHO_L, INPUT);
+  pinMode(TRIG_R, OUTPUT); pinMode(ECHO_R, INPUT);
+
+  Serial.println("Güç verildi, 5 saniye bekleniyor...");
+  delay(5000);  // ← Buradaki satır eklendi: 5000 ms bekle
+  Serial.println("Başlıyor: hedef takip + çizgi override");
+}
+
+void loop() {
+  now = millis();
+
+  // 1) Çizgi sensörü OVERRIDE
+  int rawR = analogRead(LINE_R);
+  int rawL = analogRead(LINE_L);
+  if (rawR < THRESHOLD || rawL < THRESHOLD) {
+    setMotors(KICK_SPEED, KICK_SPEED); delay(KICK_TIME);
+    setMotors(BACKUP_SPEED, BACKUP_SPEED); delay(BACKUP_TIME);
+    setMotors(-PIVOT_SPEED, PIVOT_SPEED); delay(TURN_TIME);
+    setMotors(0,0); delay(50);
+    state = SEEKING;
+    return;
+  }
+
+  // 2) Durum makinesi
+  switch(state) {
+    case SEEKING: {
+      float d1 = readDistCM(TRIG_L,ECHO_L);
+      float d2 = readDistCM(TRIG_R,ECHO_R);
+      float dAvg = (d1+d2)*0.5;
+      if ((d1>0 && d1<DETECT_DIST) || (d2>0 && d2<DETECT_DIST)) {
+        state = ATTACKING;
+        Serial.println("→ ATTACKING!");
+        break;
+      }
+      if (dAvg>MAX_LOST_DIST || dAvg<=0) {
+        state = SEARCHING;
+        Serial.println("→ SEARCHING");
+        break;
+      }
+      float error = d2 - d1;
+      float steer = constrain(Kp*error,-ROTATE_SPEED,ROTATE_SPEED);
+      int base = ATTACK_SPEED;
+      int l = constrain(base - (int)steer,-255,255);
+      int r = constrain(base + (int)steer,-255,255);
+      setMotors(r,l);
+      break;
+    }
+
+    case ATTACKING: {
+      float d1 = readDistCM(TRIG_L,ECHO_L);
+      float d2 = readDistCM(TRIG_R,ECHO_R);
+      float dAvg = (d1+d2)*0.5;
+      if (dAvg>MAX_LOST_DIST || dAvg<=0) {
+        state = SEARCHING;
+        Serial.println("→ TARGET LOST → SEARCHING");
+        break;
+      }
+      float error = d2 - d1;
+      float steer = constrain(Kp*error,-ROTATE_SPEED,ROTATE_SPEED);
+      int base = (dAvg<DETECT_DIST) ? FAST_ATTACK_SPEED : ATTACK_SPEED;
+      int l = constrain(base - (int)steer,-255,255);
+      int r = constrain(base + (int)steer,-255,255);
+      setMotors(r,l);
+      break;
+    }
+
+    case SEARCHING: {
+      setMotors(-ROTATE_SPEED,ROTATE_SPEED);
+      {
+        float d1 = readDistCM(TRIG_L,ECHO_L);
+        float d2 = readDistCM(TRIG_R,ECHO_R);
+        if ((d1>0 && d1<MAX_LOST_DIST) || (d2>0 && d2<MAX_LOST_DIST)) {
+          state = SEEKING;
+          Serial.println("→ FOUND → SEEKING");
+        }
+      }
+      break;
+    }
+
+    case BACKING: {
+      unsigned long dt = now - actionStart;
+      int sp = dt<200 ? 100 : dt<400 ? 75 : 50;
+      setMotors(sp,sp);
+      if (dt>=BACKUP_TIME) { state=TURNING; actionStart=now; }
+      break;
+    }
+
+    case TURNING: {
+      setMotors(-PIVOT_SPEED,PIVOT_SPEED);
+      if (now-actionStart>=TURN_TIME) {
+        state=SEEKING;
+        Serial.println("→ DONE TURN → SEEKING");
+      }
+      break;
+    }
+  }
+
+  delay(10);
+}
+
+// ——— MOTOR KONTROL ———
+void setMotors(int r,int l){
+  if(r>=0){ digitalWrite(IN1,HIGH);digitalWrite(IN2,LOW); analogWrite(ENA,r); }
+  else    { digitalWrite(IN1,LOW); digitalWrite(IN2,HIGH);analogWrite(ENA,-r);}
+  if(l>=0){ digitalWrite(IN3,HIGH);digitalWrite(IN4,LOW); analogWrite(ENB,l); }
+  else    { digitalWrite(IN3,LOW); digitalWrite(IN4,HIGH);analogWrite(ENB,-l);}
+}
+
+// ——— ULTRASONIC OKUMA ———
+float readDistCM(uint8_t t,uint8_t e){
+  digitalWrite(t,LOW); delayMicroseconds(2);
+  digitalWrite(t,HIGH);delayMicroseconds(10);
+  digitalWrite(t,LOW);
+  unsigned long d = pulseIn(e,HIGH,30000);
+  return d/58.0;
+}
+
